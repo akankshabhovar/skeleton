@@ -16,8 +16,11 @@ distribution-gateway/data/*.json
 distribution-gateway/data/*.db
 !distribution-gateway/data/.gitkeep
 
-# Note: build-time signing keys are generated inside the image, not in this tree,
-# so there is nothing to ignore here.
+# Note: build-time signing keys are generated inside the image, not in this tree.
+# Local test keys and fallback files are ignored:
+keys/
+*.pem
+releases.json
 
 # Logs and OS noise
 *.log

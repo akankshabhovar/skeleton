@@ -1,0 +1,16 @@
+# Node dependencies
+node_modules/
+
+# Test keypairs
+keys/
+*.pem
+
+# Database & runtime files
+releases.duckdb
+releases.json
+*.duckdb
+*.duckdb.wal
+
+# Logs & OS
+*.log
+.DS_Store
