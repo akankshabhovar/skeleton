@@ -5,8 +5,22 @@ import path from 'path';
 import os from 'os';
 
 const GATEWAY_BASE_URL = process.env.GATEWAY_URL || 'http://127.0.0.1:7070';
-const MANIFEST_PATH = process.env.MANIFEST_PATH || 'fixtures/build_manifest.csv';
-const DB_PATH = process.env.DB_PATH || 'releases.duckdb';
+
+function resolvePath(p) {
+  if (typeof p !== 'string') return p;
+  if (os.platform() === 'win32') {
+    if (p.startsWith('/app/keys/')) {
+      return path.resolve(p.replace(/^\/app\//, '../'));
+    }
+    if (p.startsWith('/app/')) {
+      return path.resolve(p.replace(/^\/app\//, ''));
+    }
+  }
+  return p;
+}
+
+const MANIFEST_PATH = resolvePath(process.env.MANIFEST_PATH || 'fixtures/build_manifest.csv');
+const DB_PATH = resolvePath(process.env.DB_PATH || 'releases.duckdb');
 
 async function main() {
   const db = new duckdb.Database(DB_PATH);
@@ -74,7 +88,7 @@ async function main() {
     }
     const keyInfo = await keyResp.json();
 
-    const certPath = keyInfo.certificate_ref;
+    const certPath = resolvePath(keyInfo.certificate_ref);
     const keyPath = certPath.endsWith('.cert.pem')
       ? certPath.replace(/\.cert\.pem$/, '.key.pem')
       : path.join(path.dirname(certPath), 'current.key.pem');
@@ -109,10 +123,14 @@ async function main() {
         const tmpDescriptorPath = path.join(tmpDir, 'descriptor.json');
         fs.writeFileSync(tmpDescriptorPath, canonicalDescriptor, 'utf8');
 
+        const opensslCmd = os.platform() === 'win32'
+          ? 'C:\\Program Files\\Git\\usr\\bin\\openssl.exe'
+          : 'openssl';
+
         let signaturePem;
         try {
           signaturePem = execFileSync(
-            'openssl',
+            opensslCmd,
             [
               'cms',
               '-sign',

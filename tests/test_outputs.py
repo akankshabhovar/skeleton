@@ -1,132 +1,275 @@
-"""Verifier tests for the RiftArena cartridge-decode repair task.
-
-Each test maps to a functional_criteria[] entry. The tests drive the headless
-scripted-playthrough harness (``riftarena.playthrough.run_playthrough``) — which
-needs no TTY and never launches the Textual UI — and compare the observed room
-graph, inventory transitions, and ending score against the canonical values
-documented in docs/arena_design_log.md.
-
-The four "repaired" tests call ``run_playthrough()`` with no arguments, so they
-read the live decode profile the player edits (config/cartridge_profile.toml).
-They pass only when that profile has been corrected; against the shipped
-(mis-configured) profile the cartridge disassembles wrongly and they fail.
-
-Run via tests/test.sh, which writes /logs/verifier/reward.txt.
-"""
-
-from __future__ import annotations
-
+import os
 import sys
-from pathlib import Path
+import subprocess
+import time
+import re
+import pathlib
+import pytest
+import requests
+import duckdb
 
-# The game lives under environment/riftarena; make its package importable
-# regardless of how pytest is invoked. Harbor runs from the workspace root.
-PROJECT_ROOT = Path.cwd() / "environment" / "riftarena"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# Determine the base directory
+BASE_DIR = pathlib.Path(__file__).resolve().parent.parent
 
-from riftarena.playthrough import run_playthrough  # noqa: E402
+# In the Docker container, files are in /app.
+# Locally on Windows, they are in the workspace root.
+if pathlib.Path("/app").exists():
+    APP_DIR = pathlib.Path("/app")
+    GW_DIR = APP_DIR / "distribution-gateway"
+    PUBLISHER_DIR = APP_DIR / "publisher"
+    KEYS_DIR = APP_DIR / "keys"
+    FIXTURES_DIR = APP_DIR / "fixtures"
+    REPORTS_DIR = APP_DIR / "reports"
+    DB_FILE = APP_DIR / "releases.duckdb"
+else:
+    APP_DIR = BASE_DIR
+    GW_DIR = APP_DIR / "environment" / "distribution-gateway"
+    PUBLISHER_DIR = APP_DIR / "environment" / "publisher"
+    KEYS_DIR = APP_DIR / "keys"
+    FIXTURES_DIR = APP_DIR / "environment" / "fixtures"
+    REPORTS_DIR = APP_DIR / "environment" / "reports"
+    DB_FILE = APP_DIR / "environment" / "releases.duckdb"
 
-# ---------------------------------------------------------------------------
-# Canonical expected outcome — the ground truth from the design log. Pinned
-# here as verifier-owned constants so grading does not depend on any value the
-# player could edit inside environment/.
-# ---------------------------------------------------------------------------
-EXPECTED_ROOM_GRAPH = {
-    0: {"name": "Rift Threshold", "exits": {"north": 1, "east": 2}},
-    1: {"name": "Echo Vault", "exits": {"south": 0, "east": 3}},
-    2: {"name": "Sunken Gallery", "exits": {"north": 3, "west": 0}},
-    3: {"name": "Obsidian Span", "exits": {"south": 2, "east": 4, "west": 1}},
-    4: {"name": "Crown Sanctum", "exits": {"west": 3}},
-}
+GATEWAY_URL = "http://127.0.0.1:7070"
 
-EXPECTED_INVENTORY_TRANSITIONS = [
-    [],
-    ["Brass Key"],
-    ["Brass Key"],
-    ["Brass Key", "Echo Shard"],
-    ["Brass Key", "Echo Shard", "Obsidian Lens"],
-    ["Brass Key", "Echo Shard", "Obsidian Lens", "Riftcrown"],
-]
+def get_openssl_cmd():
+    if sys.platform == 'win32':
+        git_openssl = pathlib.Path("C:/Program Files/Git/usr/bin/openssl.exe")
+        if git_openssl.exists():
+            return str(git_openssl)
+    return "openssl"
 
-EXPECTED_ENDING_SCORE = 400
+@pytest.fixture(scope="module", autouse=True)
+def clean_and_start_gateway():
+    # 1. Clean up database and gateway ledger for clean slate
+    if DB_FILE.exists():
+        try:
+            DB_FILE.unlink()
+        except OSError:
+            pass
 
-# A decode profile that is correct in every dimension except the quest-state
-# record stride (4 instead of the canonical 6). Rooms and items still decode
-# cleanly (so nothing crashes), but the quest-opcode stream is read against the
-# wrong byte boundaries, yielding a wrong inventory/score. Used by the
-# sensitivity check below; independent of whatever the player writes to the live
-# profile.
-_WRONG_PROFILE_TOML = """\
-[cartridge]
-title = "RiftArena: Crown of the Rift"
-revision = 2
+    ledger_file = GW_DIR / "data" / "gateway.json"
+    if ledger_file.exists():
+        try:
+            ledger_file.unlink()
+        except OSError:
+            pass
 
-[format]
-endian = "little"
-header_endian = "little"
+    env = os.environ.copy()
+    env["CURRENT_CERT_PATH"] = str(KEYS_DIR / "current" / "current.cert.pem")
+    if sys.platform == 'win32':
+        git_usr_bin = "C:\\Program Files\\Git\\usr\\bin"
+        env["PATH"] = git_usr_bin + os.pathsep + env.get("PATH", "")
 
-[opcode_widths]
-room_field = 2
-quest_opcode = 6
+    # 2. Start the gateway in the background
+    cmd = ["node", "server.js"]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(GW_DIR),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env
+    )
 
-[quest_state]
-table_offset_field = "quest_offset"
-record_stride = 4
-"""
+    # 3. Wait for the gateway to be healthy
+    healthy = False
+    for _ in range(30):
+        try:
+            res = requests.get(f"{GATEWAY_URL}/healthz", timeout=1.0)
+            if res.status_code == 200:
+                healthy = True
+                break
+        except requests.RequestException:
+            pass
+        time.sleep(0.5)
+
+    if not healthy:
+        proc.terminate()
+        raise RuntimeError("Gateway failed to start on port 7070.")
+
+    yield proc
+
+    # 4. Cleanup background gateway process
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
-def test_playthrough_runs_to_completion():
-    """functional_criteria[id=playthrough_runs_to_completion]: with a correct
-    profile the scripted playthrough loads the cartridge, quest-state database
-    and local API and runs to the goal without crashing or stalling."""
-    outcome = run_playthrough()
-    assert outcome["finished"] is True, (
-        "scripted playthrough did not reach the goal (rooms unsolvable under the "
-        "current decode profile)"
+def mask_receipt(text):
+    return re.sub(r'RECEIPT=[^\s]+', 'RECEIPT=<id>', text)
+
+
+def test_revoked_key_signature_rejected():
+    """Verify that a signature generated by the revoked key is rejected by the gateway."""
+    descriptor_obj = {
+        "artifact_count": 3,
+        "bundle_id": "BND-900",
+        "total_bytes": 148096,
+    }
+    canonical_descriptor = '{"artifact_count":3,"bundle_id":"BND-900","total_bytes":148096}'
+
+    # Use OpenSSL to sign with revoked key
+    cert_path = KEYS_DIR / "revoked" / "revoked.cert.pem"
+    key_path = KEYS_DIR / "revoked" / "revoked.key.pem"
+
+    assert cert_path.exists(), f"Revoked cert not found at {cert_path}"
+    assert key_path.exists(), f"Revoked key not found at {key_path}"
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        descriptor_file = pathlib.Path(tmp_dir) / "descriptor.json"
+        descriptor_file.write_text(canonical_descriptor, encoding="utf-8")
+
+        sig_file = pathlib.Path(tmp_dir) / "sig.pem"
+        openssl_cmd = get_openssl_cmd()
+
+        r = subprocess.run(
+            [
+                openssl_cmd, "cms", "-sign",
+                "-in", str(descriptor_file),
+                "-signer", str(cert_path),
+                "-inkey", str(key_path),
+                "-outform", "PEM",
+                "-binary"
+            ],
+            capture_output=True,
+            text=True
+        )
+        assert r.returncode == 0, f"openssl cms -sign failed: {r.stderr}"
+        signature_pem = r.stdout
+
+    # Submit to gateway and expect 400 rejection
+    res = requests.post(
+        f"{GATEWAY_URL}/v1/publications",
+        json={
+            "descriptor": descriptor_obj,
+            "signature": signature_pem,
+            "request_token": "token-test-revoked"
+        },
+        timeout=5.0
+    )
+    assert res.status_code == 400
+    res_json = res.json()
+    assert res_json.get("error") == "UNTRUSTED_SIGNATURE"
+
+
+def test_report_output_matches():
+    """Verify that the publisher runs successfully and matches the expected golden output."""
+    publisher_script = PUBLISHER_DIR / "release-publisher.mjs"
+    assert publisher_script.exists(), (
+        f"Publisher script not found at {publisher_script}. Ensure Proof B copied it first."
+    )
+
+    r = subprocess.run(
+        ["node", "publisher/release-publisher.mjs", "--report"],
+        cwd=str(PUBLISHER_DIR.parent),
+        capture_output=True,
+        text=True
+    )
+    assert r.returncode == 0, f"Publisher script failed with stdout:\n{r.stdout}\nStderr:\n{r.stderr}"
+
+    actual_output = r.stdout.strip()
+    expected_file = REPORTS_DIR / "publications.expected.txt"
+    assert expected_file.exists(), f"Expected output file not found at {expected_file}"
+    expected_output = expected_file.read_text(encoding="utf-8").strip()
+
+    masked_actual = mask_receipt(actual_output)
+    masked_expected = mask_receipt(expected_output)
+
+    assert masked_actual == masked_expected, (
+        f"CLI output mismatch.\nExpected (masked):\n{masked_expected}\nActual (masked):\n{masked_actual}"
     )
 
 
-def test_room_graph_matches_expected():
-    """functional_criteria[id=room_graph_matches_expected]: the visited rooms and
-    their exits match the documented topology. Fails while opcode widths /
-    endianness are wrong and the cartridge disassembles into wrong rooms."""
-    outcome = run_playthrough()
-    assert outcome["room_graph"] == EXPECTED_ROOM_GRAPH
+def test_withdrawals_and_duplicates_reconciled():
+    """Verify that SQL reconciliation collapsed duplicates and handled withdrawals correctly."""
+    assert DB_FILE.exists(), f"Database releases.duckdb not created at {DB_FILE}"
+
+    conn = duckdb.connect(str(DB_FILE))
+    try:
+        # Check publishable_bundles table content
+        rows = conn.execute(
+            "SELECT bundle_id, artifact_count, total_bytes FROM publishable_bundles ORDER BY bundle_id"
+        ).fetchall()
+
+        # Expected publishable bundles:
+        # BND-101: 9 artifacts, 1201575 bytes
+        # BND-102: 10 artifacts, 2188075 bytes
+        # BND-103: 8 artifacts, 2079625 bytes
+        # BND-104: completely withdrawn, should not be present!
+        expected_bundles = {
+            "BND-101": (9, 1201575),
+            "BND-102": (10, 2188075),
+            "BND-103": (8, 2079625),
+        }
+
+        assert len(rows) == 3, f"Expected exactly 3 publishable bundles, found: {len(rows)}"
+
+        for bundle_id, art_count, size_bytes in rows:
+            assert bundle_id in expected_bundles, f"Unexpected bundle ID in reconciled table: {bundle_id}"
+            exp_count, exp_size = expected_bundles[bundle_id]
+            assert art_count == exp_count, f"Mismatch in artifact count for {bundle_id}: expected {exp_count}, got {art_count}"
+            assert size_bytes == exp_size, f"Mismatch in total bytes for {bundle_id}: expected {exp_size}, got {size_bytes}"
+    finally:
+        conn.close()
 
 
-def test_inventory_transitions_match_expected():
-    """functional_criteria[id=inventory_transitions_match_expected]: the sequence
-    of inventory snapshots captured across the playthrough matches the documented
-    sequence. Fails while the quest-state table mapping is wrong."""
-    outcome = run_playthrough()
-    assert outcome["inventory_transitions"] == EXPECTED_INVENTORY_TRANSITIONS
+def test_bundles_signed_with_current_key_accepted():
+    """Verify that all submissions were signed with the current key and accepted as PUBLISHED."""
+    conn = duckdb.connect(str(DB_FILE))
+    try:
+        statuses = conn.execute("SELECT bundle_id, status FROM publications").fetchall()
+        assert len(statuses) == 3, f"Expected 3 publications in db, got {len(statuses)}"
+        for bundle_id, status in statuses:
+            assert status == "PUBLISHED", f"Bundle {bundle_id} has invalid status: {status}"
+    finally:
+        conn.close()
 
 
-def test_ending_score_matches_expected():
-    """functional_criteria[id=ending_score_matches_expected]: the final score
-    equals the documented value. Fails while endian flags or the quest-state
-    table mapping are wrong."""
-    outcome = run_playthrough()
-    assert outcome["ending_score"] == EXPECTED_ENDING_SCORE
+def test_receipts_and_tokens_persisted_in_duckdb():
+    """Verify that request tokens and receipts are correctly persisted in DuckDB."""
+    conn = duckdb.connect(str(DB_FILE))
+    try:
+        rows = conn.execute(
+            "SELECT bundle_id, request_token, publication_id, status FROM publications ORDER BY bundle_id"
+        ).fetchall()
+        for bundle_id, request_token, publication_id, status in rows:
+            assert request_token == f"token-{bundle_id}"
+            assert publication_id.startswith("pub_")
+            assert status == "PUBLISHED"
+    finally:
+        conn.close()
 
 
-def test_mis_config_fails_playthrough(tmp_path):
-    """functional_criteria[id=mis_config_fails_playthrough]: a profile with the
-    wrong decode parameters does NOT reproduce the canonical room graph /
-    inventory / score, so grading is sensitive to the repair rather than
-    tautologically satisfied."""
-    wrong_profile = tmp_path / "wrong_profile.toml"
-    wrong_profile.write_text(_WRONG_PROFILE_TOML, encoding="utf-8")
+def test_idempotent_rerun_no_duplicate_publications():
+    """Verify that rerunning the script is idempotent, reusing receipts and not duplicating gateway posts."""
+    # 1. Record gateway ledger content state
+    ledger_file = GW_DIR / "data" / "gateway.json"
+    assert ledger_file.exists(), f"Gateway ledger file not found at {ledger_file}"
+    ledger_content_before = ledger_file.read_text(encoding="utf-8")
 
-    outcome = run_playthrough(config_path=str(wrong_profile))
-
-    matches_canonical = (
-        outcome["room_graph"] == EXPECTED_ROOM_GRAPH
-        and outcome["inventory_transitions"] == EXPECTED_INVENTORY_TRANSITIONS
-        and outcome["ending_score"] == EXPECTED_ENDING_SCORE
+    # 2. Run the publisher again
+    r = subprocess.run(
+        ["node", "publisher/release-publisher.mjs", "--report"],
+        cwd=str(PUBLISHER_DIR.parent),
+        capture_output=True,
+        text=True
     )
-    assert not matches_canonical, (
-        "a deliberately mis-configured decode profile reproduced the canonical "
-        "outcome — the grader is not sensitive to the decode parameters"
-    )
+    assert r.returncode == 0, f"Rerun failed with stdout:\n{r.stdout}\nStderr:\n{r.stderr}"
+    actual_rerun_output = r.stdout.strip()
+
+    # 3. Read first run's expected output
+    expected_file = REPORTS_DIR / "publications.expected.txt"
+    expected_output = expected_file.read_text(encoding="utf-8").strip()
+
+    # 4. Compare rerun output to expected output
+    # Since rerun reuses the same receipt IDs from DuckDB, it should match the dynamic IDs from the first run!
+    masked_rerun = mask_receipt(actual_rerun_output)
+    masked_expected = mask_receipt(expected_output)
+    assert masked_rerun == masked_expected
+
+    # 5. Assert the gateway ledger file contents did not change at all
+    ledger_content_after = ledger_file.read_text(encoding="utf-8")
+    assert ledger_content_before == ledger_content_after, "Gateway ledger was modified during rerun!"
